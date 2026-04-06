@@ -1,5 +1,6 @@
 import logging
 import os
+import asyncio
 from dotenv import load_dotenv
 import sqlite3
 import requests
@@ -12,8 +13,13 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 
 # --- КОНФИГУРАЦИЯ ---
 load_dotenv()
-API_TOKEN = os.getenv('BOT_TOKEN')
-GOOGLE_SCRIPT_URL = os.getenv('GOOGLE_URL')
+API_TOKEN = os.getenv('API_TOKEN')
+GOOGLE_SCRIPT_URL = os.getenv('GOOGLE_SCRIPT_URL')
+
+if not API_TOKEN:
+    raise RuntimeError("API_TOKEN не задан в .env")
+if not GOOGLE_SCRIPT_URL:
+    raise RuntimeError("GOOGLE_SCRIPT_URL не задан в .env")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
@@ -48,7 +54,7 @@ def get_type_kb():
 # --- ОБРАБОТЧИКИ ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer(f"Привет, Юра! Я помогу считать твой заработок.", reply_markup=get_main_kb())
+    await message.answer("Привет, Юра! Я помогу считать твой заработок.", reply_markup=get_main_kb())
 
 @dp.message(F.text == "🚀 Старт")
 async def start_work(message: types.Message):
@@ -76,27 +82,48 @@ async def finish_work(message: types.Message, state: FSMContext):
     finish_time = datetime.now()
     duration = (finish_time - start_time).total_seconds() / 3600 # в часах
 
+    # Сессию закрываем сразу после фиксации финиша.
+    conn = sqlite3.connect('work_log.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM active_sessions WHERE user_id = ?", (message.from_user.id,))
+    conn.commit()
+    conn.close()
+
     await state.update_data(start=start_time, finish=finish_time, hours=round(duration, 2))
     await message.answer(f"Отработано: {round(duration, 2)} ч. Сколько заработал за этот выход (руб)?")
     await state.set_state(WorkState.waiting_for_money)
 
 @dp.message(WorkState.waiting_for_money)
 async def process_money(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("Введи число, пожалуйста.")
+    money_text = (message.text or "").replace(" ", "").replace(",", ".")
+    try:
+        money = float(money_text)
+        if money <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введи положительное число, например: 1500 или 1500.5")
         return
-    
-    await state.update_data(money=int(message.text))
+
+    await state.update_data(money=money)
     await message.answer("Какой тип обоев клеил?", reply_markup=get_type_kb())
     await state.set_state(WorkState.waiting_for_type)
 
-@dp.callback_query(F.data.startswith("type_"))
-async def process_type(callback: types.CallbackQuery, state: FSMContext): # Не забудь FSMContext
-    wallpaper_type = callback.data.split("_")[1]
+@dp.callback_query(WorkState.waiting_for_type, F.data.startswith("type_"))
+async def process_type(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if not callback.data or "_" not in callback.data:
+        await callback.message.edit_text("❌ Некорректный тип обоев.")
+        return
+    wallpaper_type = callback.data.split("_", 1)[1]
     data = await state.get_data()
+
+    required_keys = ("start", "finish", "hours", "money")
+    if any(k not in data for k in required_keys):
+        await callback.message.edit_text("❌ Сессия истекла. Начни заново: Старт -> Финиш.")
+        await state.clear()
+        return
     
     # Считаем разницу еще раз для точности (в часах)
-    # Если часов 0 (тест), берем минимум 0.01 (около 30 секунд), чтобы не было деления на 0
     work_hours = data['hours'] if data['hours'] > 0.01 else 0.02 
     
     # Рассчитываем цену часа
@@ -107,15 +134,20 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext): # Не
         "date": data['start'].strftime("%Y-%m-%d"),
         "start": data['start'].strftime("%H:%M"),
         "finish": data['finish'].strftime("%H:%M"),
-        "hours": data['hours'], # В таблицу пишем честный 0 или 0.01
+        "hours": data['hours'],
         "money": data['money'],
-        "hourly": hourly_rate,   # А цену часа считаем от минимального отрезка
+        "hourly": hourly_rate,
         "type": wallpaper_type
     }
 
-    # Отправка в Google Таблицу
+    # Отправка в Google Таблицу (ОСТАВЛЯЕМ ТОЛЬКО ОДИН РАЗ)
     try:
-        response = requests.post(GOOGLE_SCRIPT_URL, json=payload)
+        response = await asyncio.to_thread(
+            requests.post,
+            GOOGLE_SCRIPT_URL,
+            json=payload,
+            timeout=10
+        )
         if response.status_code == 200:
             await callback.message.edit_text(
                 f"✅ Записано!\n"
@@ -129,22 +161,9 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext): # Не
 
     await state.clear()
 
-    # Отправка в Google Таблицу
-    try:
-        response = requests.post(GOOGLE_SCRIPT_URL, json=payload)
-        if response.status_code == 200:
-            await callback.message.edit_text(f"✅ Данные успешно записаны в таблицу!\nИтого: {data['money']} руб.")
-        else:
-            await callback.message.edit_text("❌ Ошибка при записи в таблицу.")
-    except Exception as e:
-        await callback.message.edit_text(f"❌ Ошибка связи: {e}")
-
-    await state.clear()
-
 async def main():
     init_db()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())

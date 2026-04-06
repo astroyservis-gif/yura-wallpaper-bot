@@ -1,0 +1,8 @@
+services:
+  time-bot:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./work_log.db:/app/work_log.db
+    restart: always
